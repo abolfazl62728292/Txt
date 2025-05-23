@@ -1,0 +1,363 @@
+بله، حالا میریم سراغ ماژول مدیریت محصولات.
+
+### 🤔 Think: ماژول محصولات
+قبل از شروع کدنویسی، بیایید به موارد مهم فکر کنیم:
+
+1. مدل محصول چه ویژگی‌هایی نیاز داره؟
+   - اطلاعات پایه (نام، توضیحات، قیمت)
+   - مدیریت موجودی
+   - دسته‌بندی
+   - تصاویر محصول
+   - تاریخ‌ها برای مدیریت بهتر
+
+2. چه عملیاتی روی محصولات نیاز داریم؟
+   - CRUD (Create, Read, Update, Delete)
+   - جستجو و فیلتر
+   - مرتب‌سازی
+   - مدیریت موجودی
+
+3. سطوح دسترسی چطور باشه؟
+   - فقط ادمین و صاحب سایت بتونن محصول اضافه/ویرایش کنن
+   - همه بتونن محصولات رو ببینن
+   - مدیریت موجودی فقط توسط ادمین‌ها
+
+بیاید شروع کنیم به کدنویسی:
+
+```python name=app/models/product.py
+from datetime import datetime
+from app import db
+
+class Category(db.Model):
+    """
+    مدل دسته‌بندی محصولات
+    این مدل برای سازماندهی بهتر محصولات استفاده میشه
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), unique=True, nullable=False)
+    description = db.Column(db.String(200))
+    products = db.relationship('Product', backref='category', lazy=True)
+
+class Product(db.Model):
+    """
+    مدل محصول با تمام ویژگی‌های مورد نیاز
+    شامل ارتباط با دسته‌بندی و تاریخچه قیمت
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text)
+    price = db.Column(db.Float, nullable=False)
+    stock = db.Column(db.Integer, default=0)
+    category_id = db.Column(db.Integer, db.ForeignKey('category.id'))
+    images = db.relationship('ProductImage', backref='product', lazy=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        """
+        تبدیل محصول به دیکشنری برای API
+        """
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'price': self.price,
+            'stock': self.stock,
+            'category': self.category.name if self.category else None,
+            'images': [img.url for img in self.images],
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat()
+        }
+    
+    def update_stock(self, quantity, operation='add'):
+        """
+        بروزرسانی موجودی محصول
+        operation: 'add' برای اضافه کردن، 'subtract' برای کم کردن
+        """
+        if operation == 'add':
+            self.stock += quantity
+        elif operation == 'subtract':
+            if self.stock >= quantity:
+                self.stock -= quantity
+            else:
+                raise ValueError('موجودی کافی نیست')
+        db.session.commit()
+
+class ProductImage(db.Model):
+    """
+    مدل تصاویر محصول
+    هر محصول می‌تونه چند تا تصویر داشته باشه
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    url = db.Column(db.String(200), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'), nullable=False)
+    is_primary = db.Column(db.Boolean, default=False)
+```
+
+### 🤔 Think: روت‌ها و کنترلرها
+حالا نیاز داریم endpoint های مختلف برای مدیریت محصولات بسازیم:
+
+```python name=app/products/routes.py
+from flask import Blueprint, render_template, request, jsonify, abort
+from flask_login import login_required, current_user
+from app.models.product import Product, Category
+from app import db
+from app.utils.decorators import admin_required
+
+products = Blueprint('products', __name__)
+
+@products.route('/products')
+def list_products():
+    """
+    نمایش لیست محصولات
+    با قابلیت فیلتر و جستجو
+    """
+    page = request.args.get('page', 1, type=int)
+    category = request.args.get('category')
+    search = request.args.get('search')
+    
+    query = Product.query
+    
+    if category:
+        query = query.filter_by(category_id=category)
+    if search:
+        query = query.filter(Product.name.ilike(f'%{search}%'))
+    
+    products = query.paginate(page=page, per_page=12)
+    categories = Category.query.all()
+    
+    return render_template('products/list.html', 
+                         products=products,
+                         categories=categories)
+
+@products.route('/products/<int:id>')
+def product_detail(id):
+    """
+    نمایش جزئیات یک محصول
+    """
+    product = Product.query.get_or_404(id)
+    return render_template('products/detail.html', product=product)
+
+@products.route('/admin/products', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def manage_products():
+    """
+    مدیریت محصولات - فقط برای ادمین
+    """
+    if request.method == 'POST':
+        # اضافه کردن محصول جدید
+        data = request.form
+        product = Product(
+            name=data['name'],
+            description=data['description'],
+            price=float(data['price']),
+            stock=int(data['stock']),
+            category_id=int(data['category'])
+        )
+        db.session.add(product)
+        db.session.commit()
+        
+        return jsonify(product.to_dict()), 201
+    
+    # نمایش لیست محصولات برای مدیریت
+    products = Product.query.all()
+    categories = Category.query.all()
+    return render_template('admin/products.html',
+                         products=products,
+                         categories=categories)
+```
+
+```html name=app/templates/products/list.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>محصولات</title>
+</head>
+<body>
+    <h1>لیست محصولات</h1>
+    
+    <!-- فیلتر و جستجو -->
+    <div class="filters">
+        <form method="GET">
+            <select name="category">
+                <option value="">همه دسته‌ها</option>
+                {% for category in categories %}
+                <option value="{{ category.id }}">{{ category.name }}</option>
+                {% endfor %}
+            </select>
+            
+            <input type="text" name="search" placeholder="جستجو...">
+            <button type="submit">اعمال فیلتر</button>
+        </form>
+    </div>
+
+    <!-- لیست محصولات -->
+    <div class="products-grid">
+        {% for product in products.items %}
+        <div class="product-card">
+            {% if product.images %}
+            <img src="{{ product.images[0].url }}" alt="{{ product.name }}">
+            {% endif %}
+            
+            <h3>{{ product.name }}</h3>
+            <p class="price">{{ product.price }} تومان</p>
+            
+            {% if product.stock > 0 %}
+            <p class="stock">موجود در انبار: {{ product.stock }} عدد</p>
+            <button onclick="addToCart({{ product.id }})">افزودن به سبد خرید</button>
+            {% else %}
+            <p class="out-of-stock">ناموجود</p>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- صفحه‌بندی -->
+    <div class="pagination">
+        {% if products.has_prev %}
+        <a href="{{ url_for('products.list_products', page=products.prev_num) }}">قبلی</a>
+        {% endif %}
+        
+        <span>صفحه {{ products.page }} از {{ products.pages }}</span>
+        
+        {% if products.has_next %}
+        <a href="{{ url_for('products.list_products', page=products.next_num) }}">بعدی</a>
+        {% endif %}
+    </div>
+</body>
+</html>
+```
+
+```html name=app/templates/admin/products.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>مدیریت محصولات</title>
+</head>
+<body>
+    <h1>مدیریت محصولات</h1>
+
+    <!-- فرم اضافه کردن محصول جدید -->
+    <div class="add-product-form">
+        <h2>افزودن محصول جدید</h2>
+        <form method="POST">
+            <div>
+                <label for="name">نام محصول:</label>
+                <input type="text" id="name" name="name" required>
+            </div>
+            
+            <div>
+                <label for="description">توضیحات:</label>
+                <textarea id="description" name="description" required></textarea>
+            </div>
+            
+            <div>
+                <label for="price">قیمت:</label>
+                <input type="number" id="price" name="price" required>
+            </div>
+            
+            <div>
+                <label for="stock">موجودی:</label>
+                <input type="number" id="stock" name="stock" required>
+            </div>
+            
+            <div>
+                <label for="category">دسته‌بندی:</label>
+                <select id="category" name="category" required>
+                    {% for category in categories %}
+                    <option value="{{ category.id }}">{{ category.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            
+            <button type="submit">افزودن محصول</button>
+        </form>
+    </div>
+
+    <!-- لیست محصولات -->
+    <div class="products-list">
+        <h2>لیست محصولات موجود</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>نام</th>
+                    <th>قیمت</th>
+                    <th>موجودی</th>
+                    <th>دسته‌بندی</th>
+                    <th>عملیات</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for product in products %}
+                <tr>
+                    <td>{{ product.name }}</td>
+                    <td>{{ product.price }}</td>
+                    <td>{{ product.stock }}</td>
+                    <td>{{ product.category.name }}</td>
+                    <td>
+                        <button onclick="editProduct({{ product.id }})">ویرایش</button>
+                        <button onclick="deleteProduct({{ product.id }})">حذف</button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+```
+
+### 🤔 Think: Utilities و Decorators
+برای مدیریت بهتر دسترسی‌ها، نیاز به چند decorator داریم:
+
+```python name=app/utils/decorators.py
+from functools import wraps
+from flask import abort
+from flask_login import current_user
+
+def admin_required(f):
+    """
+    دکوریتور برای محدود کردن دسترسی به ادمین‌ها
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin():
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated_function
+
+def owner_required(f):
+    """
+    دکوریتور برای محدود کردن دسترسی به صاحب سایت
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_owner():
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated_function
+```
+
+### 🎯 نکات مهم در این مرحله:
+1. مدل‌سازی کامل محصولات با در نظر گرفتن:
+   - دسته‌بندی
+   - تصاویر
+   - موجودی
+   
+2. پیاده‌سازی API‌های مورد نیاز:
+   - نمایش محصولات با فیلتر و جستجو
+   - مدیریت محصولات برای ادمین
+   
+3. امنیت و دسترسی:
+   - استفاده از decoratorها برای کنترل دسترسی
+   - جداسازی بخش‌های عمومی و مدیریتی
+
+4. قابلیت‌های کاربردی:
+   - فیلتر و جستجو
+   - صفحه‌بندی
+   - مدیریت موجودی
+
+آیا مایلید:
+1. به سراغ ماژول بعدی (سبد خرید) بریم؟
+2. تست‌های این بخش رو بنویسیم؟
+3. یا سؤالی در مورد این بخش دارید؟
