@@ -635,3 +635,1094 @@ def owner_required(f):
 1. به سراغ ماژول بعدی (سبد خرید) بریم؟
 2. تست‌های این بخش رو بنویسیم؟
 3. یا سؤالی در مورد این بخش دارید؟
+بسیار خب، بریم سراغ ماژول سبد خرید و سفارشات!
+
+### 🤔 Think: ماژول سبد خرید و سفارشات
+باید به چند نکته‌ی مهم فکر کنم:
+
+1. مدیریت سبد خرید:
+   - سبد خرید موقت برای کاربران مهمان چطور مدیریت بشه؟
+   - چطور اطمینان حاصل کنیم که موجودی در لحظه‌ی خرید کافی هست؟
+   - آیا محدودیتی برای تعداد آیتم‌ها در سبد خرید بذاریم؟
+
+2. فرآیند سفارش:
+   - وضعیت‌های مختلف سفارش چی‌ها باشن؟
+   - چطور از تراکنش‌های همزمان جلوگیری کنیم؟
+   - لاگ تغییرات وضعیت سفارش رو کجا نگه داریم؟
+
+3. مسائل امنیتی:
+   - چطور از دستکاری قیمت‌ها جلوگیری کنیم؟
+   - چطور مطمئن بشیم که کاربر فقط به سفارشات خودش دسترسی داره؟
+
+بیاید شروع کنیم به کدنویسی:
+
+```python name=app/models/cart.py
+from datetime import datetime
+from app import db
+from app.models.product import Product
+
+class Cart(db.Model):
+    """
+    مدل سبد خرید
+    - برای کاربران لاگین شده: user_id پر میشه
+    - برای کاربران مهمان: session_id پر میشه
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    session_id = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    items = db.relationship('CartItem', backref='cart', lazy=True, cascade='all, delete-orphan')
+    
+    @property
+    def total_price(self):
+        """
+        محاسبه قیمت کل سبد خرید
+        با در نظر گرفتن تعداد هر محصول
+        """
+        return sum(item.product.price * item.quantity for item in self.items)
+    
+    def add_item(self, product_id, quantity=1):
+        """
+        اضافه کردن محصول به سبد خرید
+        اگر محصول قبلاً در سبد باشه، فقط تعدادش اضافه میشه
+        """
+        existing_item = CartItem.query.filter_by(
+            cart_id=self.id, 
+            product_id=product_id
+        ).first()
+        
+        if existing_item:
+            existing_item.quantity += quantity
+        else:
+            item = CartItem(product_id=product_id, quantity=quantity)
+            self.items.append(item)
+        
+        db.session.commit()
+    
+    def update_item(self, product_id, quantity):
+        """
+        بروزرسانی تعداد یک محصول در سبد خرید
+        """
+        item = CartItem.query.filter_by(
+            cart_id=self.id,
+            product_id=product_id
+        ).first()
+        
+        if item:
+            if quantity > 0:
+                item.quantity = quantity
+            else:
+                db.session.delete(item)
+            
+            db.session.commit()
+
+class CartItem(db.Model):
+    """
+    مدل آیتم‌های داخل سبد خرید
+    هر آیتم شامل یک محصول و تعداد آن است
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    cart_id = db.Column(db.Integer, db.ForeignKey('cart.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'), nullable=False)
+    quantity = db.Column(db.Integer, default=1)
+    product = db.relationship('Product')
+```
+
+```python name=app/models/order.py
+from datetime import datetime
+from app import db
+
+class Order(db.Model):
+    """
+    مدل سفارش
+    شامل اطلاعات کامل سفارش و وضعیت آن
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    status = db.Column(db.String(20), default='pending')  # pending, paid, shipped, delivered, cancelled
+    total_price = db.Column(db.Float, nullable=False)
+    address = db.Column(db.Text, nullable=False)
+    phone = db.Column(db.String(15), nullable=False)
+    tracking_code = db.Column(db.String(20), unique=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    items = db.relationship('OrderItem', backref='order', lazy=True)
+    status_changes = db.relationship('OrderStatusLog', backref='order', lazy=True)
+
+    def update_status(self, new_status, note=None):
+        """
+        بروزرسانی وضعیت سفارش
+        با ثبت در تاریخچه تغییرات
+        """
+        if new_status != self.status:
+            self.status = new_status
+            log = OrderStatusLog(
+                order_id=self.id,
+                old_status=self.status,
+                new_status=new_status,
+                note=note
+            )
+            db.session.add(log)
+            db.session.commit()
+
+class OrderItem(db.Model):
+    """
+    مدل آیتم‌های سفارش
+    قیمت هر آیتم در زمان خرید ذخیره میشه
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'), nullable=False)
+    quantity = db.Column(db.Integer, nullable=False)
+    price = db.Column(db.Float, nullable=False)  # قیمت در زمان خرید
+    product = db.relationship('Product')
+
+class OrderStatusLog(db.Model):
+    """
+    مدل لاگ تغییرات وضعیت سفارش
+    برای پیگیری تاریخچه تغییرات
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('order.id'), nullable=False)
+    old_status = db.Column(db.String(20))
+    new_status = db.Column(db.String(20), nullable=False)
+    note = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+```
+
+### 🤔 Think: مدیریت سبد خرید
+حالا نیاز به API‌ها و روت‌های مدیریت سبد خرید داریم:
+
+```python name=app/cart/routes.py
+from flask import Blueprint, jsonify, request, session
+from flask_login import current_user, login_required
+from app.models.cart import Cart, CartItem
+from app.models.product import Product
+from app import db
+
+cart = Blueprint('cart', __name__)
+
+def get_or_create_cart():
+    """
+    گرفتن سبد خرید کاربر یا ساخت سبد جدید
+    برای کاربران مهمان از session_id استفاده می‌کنه
+    """
+    if current_user.is_authenticated:
+        cart = Cart.query.filter_by(user_id=current_user.id).first()
+    else:
+        if 'cart_session_id' not in session:
+            session['cart_session_id'] = str(uuid.uuid4())
+        cart = Cart.query.filter_by(session_id=session['cart_session_id']).first()
+    
+    if not cart:
+        cart = Cart(
+            user_id=current_user.id if current_user.is_authenticated else None,
+            session_id=session.get('cart_session_id')
+        )
+        db.session.add(cart)
+        db.session.commit()
+    
+    return cart
+
+@cart.route('/api/cart/add', methods=['POST'])
+def add_to_cart():
+    """
+    اضافه کردن محصول به سبد خرید
+    با بررسی موجودی
+    """
+    data = request.get_json()
+    product_id = data.get('product_id')
+    quantity = data.get('quantity', 1)
+    
+    product = Product.query.get_or_404(product_id)
+    
+    # بررسی موجودی
+    if product.stock < quantity:
+        return jsonify({
+            'error': 'موجودی کافی نیست',
+            'available': product.stock
+        }), 400
+    
+    cart = get_or_create_cart()
+    cart.add_item(product_id, quantity)
+    
+    return jsonify({
+        'message': 'محصول به سبد خرید اضافه شد',
+        'cart_total': cart.total_price
+    })
+
+@cart.route('/api/cart/update', methods=['PUT'])
+def update_cart():
+    """
+    بروزرسانی تعداد محصول در سبد خرید
+    """
+    data = request.get_json()
+    product_id = data.get('product_id')
+    quantity = data.get('quantity', 0)
+    
+    cart = get_or_create_cart()
+    cart.update_item(product_id, quantity)
+    
+    return jsonify({
+        'message': 'سبد خرید بروز شد',
+        'cart_total': cart.total_price
+    })
+```
+
+### 🤔 Think: مدیریت سفارش
+و در نهایت، API‌های مدیریت سفارش:
+
+```python name=app/orders/routes.py
+from flask import Blueprint, jsonify, request
+from flask_login import current_user, login_required
+from app.models.order import Order, OrderItem
+from app.models.cart import Cart
+from app import db
+import uuid
+
+orders = Blueprint('orders', __name__)
+
+@orders.route('/api/orders/create', methods=['POST'])
+@login_required
+def create_order():
+    """
+    ایجاد سفارش از روی سبد خرید
+    با بررسی مجدد موجودی و قیمت‌ها
+    """
+    data = request.get_json()
+    cart = Cart.query.filter_by(user_id=current_user.id).first()
+    
+    if not cart or not cart.items:
+        return jsonify({'error': 'سبد خرید خالی است'}), 400
+    
+    # بررسی موجودی
+    for item in cart.items:
+        if item.product.stock < item.quantity:
+            return jsonify({
+                'error': f'موجودی {item.product.name} کافی نیست',
+                'available': item.product.stock
+            }), 400
+    
+    try:
+        # ایجاد سفارش
+        order = Order(
+            user_id=current_user.id,
+            total_price=cart.total_price,
+            address=data['address'],
+            phone=data['phone'],
+            tracking_code=str(uuid.uuid4())[:8].upper()
+        )
+        db.session.add(order)
+        
+        # اضافه کردن آیتم‌ها
+        for item in cart.items:
+            order_item = OrderItem(
+                product_id=item.product_id,
+                quantity=item.quantity,
+                price=item.product.price
+            )
+            order.items.append(order_item)
+            
+            # بروزرسانی موجودی
+            item.product.update_stock(item.quantity, 'subtract')
+        
+        # پاک کردن سبد خرید
+        db.session.delete(cart)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'سفارش با موفقیت ثبت شد',
+            'order_id': order.id,
+            'tracking_code': order.tracking_code
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'خطا در ثبت سفارش'}), 500
+
+@orders.route('/api/orders/<tracking_code>')
+@login_required
+def get_order(tracking_code):
+    """
+    دریافت اطلاعات سفارش با کد پیگیری
+    فقط برای کاربر صاحب سفارش
+    """
+    order = Order.query.filter_by(tracking_code=tracking_code).first_or_404()
+    
+    # بررسی دسترسی
+    if order.user_id != current_user.id and not current_user.is_admin():
+        return jsonify({'error': 'دسترسی غیرمجاز'}), 403
+    
+    return jsonify({
+        'id': order.id,
+        'status': order.status,
+        'total_price': order.total_price,
+        'tracking_code': order.tracking_code,
+        'created_at': order.created_at.isoformat(),
+        'items': [{
+            'product_name': item.product.name,
+            'quantity': item.quantity,
+            'price': item.price
+        } for item in order.items],
+        'status_history': [{
+            'status': log.new_status,
+            'date': log.created_at.isoformat(),
+            'note': log.note
+        } for log in order.status_changes]
+    })
+```
+
+### 🎯 نکات مهم در این مرحله:
+1. مدیریت همزمان سبد خرید برای کاربران مهمان و لاگین شده
+2. بررسی‌های امنیتی:
+   - کنترل موجودی در زمان اضافه کردن به سبد و ثبت سفارش
+   - ذخیره قیمت در زمان سفارش برای جلوگیری از مشکلات تغییر قیمت
+   - کنترل دسترسی به سفارشات
+
+3. ویژگی‌های پیشرفته:
+   - لاگ تغییرات وضعیت سفارش
+   - کد پیگیری منحصر به فرد
+   - تاریخچه کامل سفارش
+
+4. مدیریت خطاها:
+   - استفاده از تراکنش‌ها برای اطمینان از صحت داده‌ها
+   - بازگشت خطاهای مناسب به کاربر
+
+آیا مایلید:
+1. به سراغ ماژول بعدی (پنل مدیریت) بریم؟
+2. نمونه UI برای این بخش ببینید؟
+3. یا سؤالی در مورد این بخش دارید؟
+خب، بریم سراغ ماژول پنل مدیریت که بخش مهمی از سیستمه!
+
+### 🤔 Think: ماژول پنل مدیریت
+قبل از کدنویسی به چند نکته مهم فکر می‌کنم:
+
+1. دسترسی‌های متفاوت:
+   - صاحب سایت چه امکاناتی بیشتر از ادمین داشته باشه؟
+   - چطور از دسترسی غیرمجاز جلوگیری کنیم؟
+   - آیا نیاز به لاگ فعالیت‌های مدیریتی داریم؟
+
+2. داشبورد و گزارشات:
+   - چه آماری برای صاحب سایت مهمه؟
+   - گزارشات مالی چطور محاسبه و نمایش داده بشن؟
+   - نمودارها و گراف‌ها چطور آپدیت بشن؟
+
+3. عملکرد و کارایی:
+   - چطور از کش استفاده کنیم برای گزارشات سنگین؟
+   - محاسبات رو کجا انجام بدیم که سرور رو درگیر نکنه؟
+
+بیاید شروع کنیم به کدنویسی:
+
+```python name=app/admin/models.py
+from datetime import datetime
+from app import db
+
+class AdminLog(db.Model):
+    """
+    مدل لاگ فعالیت‌های مدیریتی
+    برای ثبت و پیگیری تغییرات مهم
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    admin_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    action = db.Column(db.String(50), nullable=False)  # نوع عملیات
+    entity_type = db.Column(db.String(50))  # نوع موجودیت (محصول، سفارش و...)
+    entity_id = db.Column(db.Integer)  # شناسه موجودیت
+    details = db.Column(db.JSON)  # جزئیات تغییرات
+    ip_address = db.Column(db.String(45))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class DashboardCache(db.Model):
+    """
+    مدل کش داشبورد
+    برای ذخیره موقت گزارشات سنگین
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    cache_key = db.Column(db.String(100), unique=True, nullable=False)
+    data = db.Column(db.JSON)
+    expires_at = db.Column(db.DateTime, nullable=False)
+```
+
+```python name=app/admin/utils.py
+from datetime import datetime, timedelta
+from app.models.order import Order
+from app.models.product import Product
+from app.admin.models import DashboardCache
+from app import db
+import json
+
+def get_sales_stats(period='daily'):
+    """
+    محاسبه آمار فروش
+    با قابلیت کش کردن نتایج
+    """
+    cache_key = f'sales_stats_{period}_{datetime.now().strftime("%Y%m%d")}'
+    cached = DashboardCache.query.filter_by(cache_key=cache_key).first()
+    
+    if cached and cached.expires_at > datetime.now():
+        return json.loads(cached.data)
+    
+    # محاسبه آمار جدید
+    if period == 'daily':
+        start_date = datetime.now() - timedelta(days=30)
+        group_format = '%Y-%m-%d'
+    elif period == 'monthly':
+        start_date = datetime.now() - timedelta(days=365)
+        group_format = '%Y-%m'
+    
+    sales_data = db.session.query(
+        db.func.strftime(group_format, Order.created_at).label('date'),
+        db.func.sum(Order.total_price).label('total'),
+        db.func.count(Order.id).label('count')
+    ).filter(
+        Order.status == 'delivered',
+        Order.created_at >= start_date
+    ).group_by('date').all()
+    
+    result = {
+        'labels': [row.date for row in sales_data],
+        'totals': [float(row.total) for row in sales_data],
+        'counts': [row.count for row in sales_data]
+    }
+    
+    # ذخیره در کش
+    cache = DashboardCache(
+        cache_key=cache_key,
+        data=json.dumps(result),
+        expires_at=datetime.now() + timedelta(hours=1)
+    )
+    db.session.add(cache)
+    db.session.commit()
+    
+    return result
+
+def log_admin_action(admin_user, action, entity_type=None, entity_id=None, details=None, request=None):
+    """
+    ثبت فعالیت‌های مدیریتی
+    """
+    log = AdminLog(
+        admin_id=admin_user.id,
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        details=details,
+        ip_address=request.remote_addr if request else None
+    )
+    db.session.add(log)
+    db.session.commit()
+```
+
+```python name=app/admin/routes.py
+from flask import Blueprint, render_template, jsonify, request
+from flask_login import login_required, current_user
+from app.utils.decorators import admin_required, owner_required
+from app.admin.utils import get_sales_stats, log_admin_action
+from app.models.order import Order
+from app.models.product import Product
+from app.models.user import User
+from app import db
+
+admin = Blueprint('admin', __name__)
+
+@admin.route('/admin/dashboard')
+@login_required
+@admin_required
+def dashboard():
+    """
+    داشبورد اصلی مدیریت
+    نمایش آمار کلی و نمودارها
+    """
+    # آمار کلی
+    stats = {
+        'total_orders': Order.query.count(),
+        'pending_orders': Order.query.filter_by(status='pending').count(),
+        'total_products': Product.query.count(),
+        'low_stock_products': Product.query.filter(Product.stock < 10).count(),
+        'total_users': User.query.filter_by(role='customer').count()
+    }
+    
+    # آمار فروش
+    sales_data = get_sales_stats('daily')
+    
+    return render_template('admin/dashboard.html',
+                         stats=stats,
+                         sales_data=sales_data)
+
+@admin.route('/admin/orders')
+@login_required
+@admin_required
+def manage_orders():
+    """
+    مدیریت سفارشات
+    با قابلیت فیلتر و جستجو
+    """
+    page = request.args.get('page', 1, type=int)
+    status = request.args.get('status')
+    search = request.args.get('search')
+    
+    query = Order.query
+    
+    if status:
+        query = query.filter_by(status=status)
+    if search:
+        query = query.join(User).filter(
+            (User.username.ilike(f'%{search}%')) |
+            (Order.tracking_code.ilike(f'%{search}%'))
+        )
+    
+    orders = query.order_by(Order.created_at.desc()).paginate(
+        page=page, per_page=20
+    )
+    
+    return render_template('admin/orders.html', orders=orders)
+
+@admin.route('/admin/users')
+@login_required
+@owner_required
+def manage_users():
+    """
+    مدیریت کاربران - فقط برای صاحب سایت
+    """
+    users = User.query.order_by(User.created_at.desc()).all()
+    return render_template('admin/users.html', users=users)
+
+@admin.route('/admin/reports/sales', methods=['GET'])
+@login_required
+@owner_required
+def sales_report():
+    """
+    گزارش فروش - فقط برای صاحب سایت
+    با فیلترهای مختلف و امکان دانلود
+    """
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    
+    query = db.session.query(
+        Order.id,
+        User.username,
+        Order.total_price,
+        Order.status,
+        Order.created_at
+    ).join(User)
+    
+    if start_date:
+        query = query.filter(Order.created_at >= start_date)
+    if end_date:
+        query = query.filter(Order.created_at <= end_date)
+    
+    results = query.all()
+    
+    if request.args.get('download'):
+        # ایجاد فایل CSV برای دانلود
+        return create_csv_response(results)
+    
+    return jsonify([{
+        'order_id': r.id,
+        'username': r.username,
+        'total': r.total_price,
+        'status': r.status,
+        'date': r.created_at.isoformat()
+    } for r in results])
+```
+
+```html name=app/templates/admin/dashboard.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>پنل مدیریت - داشبورد</title>
+</head>
+<body>
+    <h1>داشبورد مدیریت</h1>
+
+    <!-- آمار کلی -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <h3>سفارشات</h3>
+            <p class="number">{{ stats.total_orders }}</p>
+            <p class="subtitle">سفارشات در انتظار: {{ stats.pending_orders }}</p>
+        </div>
+        
+        <div class="stat-card">
+            <h3>محصولات</h3>
+            <p class="number">{{ stats.total_products }}</p>
+            <p class="subtitle">موجودی کم: {{ stats.low_stock_products }}</p>
+        </div>
+        
+        <div class="stat-card">
+            <h3>کاربران</h3>
+            <p class="number">{{ stats.total_users }}</p>
+        </div>
+    </div>
+
+    <!-- نمودار فروش -->
+    <div class="sales-chart">
+        <h3>نمودار فروش</h3>
+        <div class="chart-controls">
+            <button onclick="updateChart('daily')">روزانه</button>
+            <button onclick="updateChart('monthly')">ماهانه</button>
+        </div>
+        <canvas id="salesChart"></canvas>
+    </div>
+
+    <!-- آخرین فعالیت‌ها -->
+    <div class="recent-activity">
+        <h3>آخرین فعالیت‌ها</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>تاریخ</th>
+                    <th>ادمین</th>
+                    <th>عملیات</th>
+                    <th>جزئیات</th>
+                </tr>
+            </thead>
+            <tbody id="activityLog">
+                <!-- با JavaScript پر میشه -->
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+```
+
+### 🎯 نکات مهم در این ماژول:
+1. مدیریت دسترسی‌ها:
+   - تفکیک عملیات‌های مخصوص صاحب سایت
+   - لاگ کردن همه فعالیت‌های مدیریتی
+   - کنترل دسترسی در سطح API
+
+2. بهینه‌سازی عملکرد:
+   - کش کردن گزارشات سنگین
+   - صفحه‌بندی برای لیست‌های طولانی
+   - کوئری‌های بهینه‌شده
+
+3. ویژگی‌های پیشرفته:
+   - گزارشات آماری متنوع
+   - نمودارهای تعاملی
+   - امکان دانلود گزارشات
+
+4. امنیت:
+   - ثبت IP برای فعالیت‌های مدیریتی
+   - محدودیت دسترسی براساس نقش
+   - لاگ تمام تغییرات حساس
+
+آیا مایلید:
+1. به سراغ ماژول آخر (سیستم نظرات و امتیازدهی) بریم؟
+2. تست‌های این بخش رو بنویسیم؟
+3. یا سؤالی در مورد این بخش دارید؟
+بله، بیایید به سراغ ماژول نظرات و امتیازدهی بریم که آخرین بخش پروژه‌مونه!
+
+### 🤔 Think: ماژول نظرات و امتیازدهی
+قبل از شروع کدنویسی به نکات مهم فکر می‌کنم:
+
+1. مدیریت نظرات:
+   - چطور از نظرات اسپم جلوگیری کنیم؟
+   - آیا کاربر باید محصول رو خریده باشه تا بتونه نظر بده؟
+   - چطور میانگین امتیازات رو بروز نگه داریم؟
+
+2. سیستم امتیازدهی:
+   - مقیاس امتیازدهی چند ستاره باشه؟ (5 ستاره معمول‌تره)
+   - آیا امکان ویرایش امتیاز وجود داشته باشه؟
+   - چطور امتیازات رو تحلیل کنیم؟
+
+3. مدیریت محتوا:
+   - فیلتر کردن محتوای نامناسب؟
+   - امکان گزارش نظرات نامناسب؟
+   - سیستم تأیید نظرات چطور باشه؟
+
+بیاید شروع کنیم به کدنویسی:
+
+```python name=app/models/review.py
+from datetime import datetime
+from app import db
+from sqlalchemy.event import listens_for
+from sqlalchemy import func
+
+class Review(db.Model):
+    """
+    مدل نظرات و امتیازات محصولات
+    با قابلیت تأیید و گزارش
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'), nullable=False)
+    order_id = db.Column(db.Integer, db.ForeignKey('order.id'))  # برای تأیید خرید
+    rating = db.Column(db.Integer, nullable=False)  # 1 تا 5
+    comment = db.Column(db.Text)
+    pros = db.Column(db.Text)  # نقاط قوت
+    cons = db.Column(db.Text)  # نقاط ضعف
+    is_verified = db.Column(db.Boolean, default=False)  # تأیید شده توسط ادمین
+    is_purchased = db.Column(db.Boolean, default=False)  # آیا محصول خریداری شده
+    reports_count = db.Column(db.Integer, default=0)  # تعداد گزارش‌های نامناسب بودن
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relations
+    user = db.relationship('User', backref='reviews')
+    product = db.relationship('Product', backref='reviews')
+    replies = db.relationship('ReviewReply', backref='review', lazy=True)
+    
+    def to_dict(self):
+        """
+        تبدیل نظر به دیکشنری برای API
+        """
+        return {
+            'id': self.id,
+            'user': self.user.username,
+            'rating': self.rating,
+            'comment': self.comment,
+            'pros': self.pros.split('\n') if self.pros else [],
+            'cons': self.cons.split('\n') if self.cons else [],
+            'is_verified': self.is_verified,
+            'is_purchased': self.is_purchased,
+            'created_at': self.created_at.isoformat(),
+            'replies': [reply.to_dict() for reply in self.replies]
+        }
+
+class ReviewReply(db.Model):
+    """
+    مدل پاسخ به نظرات
+    برای پاسخ‌های ادمین یا فروشنده
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    review_id = db.Column(db.Integer, db.ForeignKey('review.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    user = db.relationship('User')
+    
+    def to_dict(self):
+        return {
+            'user': self.user.username,
+            'content': self.content,
+            'created_at': self.created_at.isoformat()
+        }
+
+class ReportedReview(db.Model):
+    """
+    مدل گزارش نظرات نامناسب
+    """
+    id = db.Column(db.Integer, primary_key=True)
+    review_id = db.Column(db.Integer, db.ForeignKey('review.id'), nullable=False)
+    reporter_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    reason = db.Column(db.String(100), nullable=False)
+    details = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+# Event listeners for updating product rating
+@listens_for(Review, 'after_insert')
+@listens_for(Review, 'after_update')
+@listens_for(Review, 'after_delete')
+def update_product_rating(mapper, connection, target):
+    """
+    بروزرسانی خودکار میانگین امتیاز محصول
+    هر بار که نظری اضافه، ویرایش یا حذف می‌شود
+    """
+    avg_rating = db.session.query(func.avg(Review.rating))\
+        .filter(Review.product_id == target.product_id,
+                Review.is_verified == True)\
+        .scalar()
+    
+    if avg_rating:
+        connection.execute(
+            Product.__table__.update()
+            .where(Product.id == target.product_id)
+            .values(average_rating=float(avg_rating))
+        )
+```
+
+```python name=app/reviews/routes.py
+from flask import Blueprint, jsonify, request
+from flask_login import current_user, login_required
+from app.models.review import Review, ReviewReply, ReportedReview
+from app.models.order import Order
+from app.utils.decorators import admin_required
+from app import db
+import bleach  # برای پاکسازی HTML از نظرات
+
+reviews = Blueprint('reviews', __name__)
+
+@reviews.route('/api/products/<int:product_id>/reviews', methods=['POST'])
+@login_required
+def add_review(product_id):
+    """
+    افزودن نظر جدید
+    با بررسی خرید محصول و پاکسازی محتوا
+    """
+    # بررسی خرید محصول
+    has_purchased = Order.query.join(OrderItem)\
+        .filter(Order.user_id == current_user.id,
+                OrderItem.product_id == product_id,
+                Order.status == 'delivered')\
+        .first() is not None
+    
+    data = request.get_json()
+    
+    # پاکسازی محتوا
+    clean_comment = bleach.clean(data.get('comment', ''), tags=[])
+    clean_pros = bleach.clean(data.get('pros', ''), tags=[])
+    clean_cons = bleach.clean(data.get('cons', ''), tags=[])
+    
+    review = Review(
+        user_id=current_user.id,
+        product_id=product_id,
+        rating=data['rating'],
+        comment=clean_comment,
+        pros=clean_pros,
+        cons=clean_cons,
+        is_purchased=has_purchased
+    )
+    
+    db.session.add(review)
+    db.session.commit()
+    
+    return jsonify(review.to_dict()), 201
+
+@reviews.route('/api/reviews/<int:review_id>/reply', methods=['POST'])
+@login_required
+@admin_required
+def reply_to_review(review_id):
+    """
+    پاسخ به نظر توسط ادمین
+    """
+    review = Review.query.get_or_404(review_id)
+    data = request.get_json()
+    
+    reply = ReviewReply(
+        review_id=review_id,
+        user_id=current_user.id,
+        content=bleach.clean(data['content'], tags=[])
+    )
+    
+    db.session.add(reply)
+    db.session.commit()
+    
+    return jsonify(reply.to_dict()), 201
+
+@reviews.route('/api/reviews/<int:review_id>/report', methods=['POST'])
+@login_required
+def report_review(review_id):
+    """
+    گزارش نظر نامناسب
+    """
+    review = Review.query.get_or_404(review_id)
+    data = request.get_json()
+    
+    # بررسی گزارش تکراری
+    existing_report = ReportedReview.query.filter_by(
+        review_id=review_id,
+        reporter_id=current_user.id
+    ).first()
+    
+    if existing_report:
+        return jsonify({'error': 'شما قبلاً این نظر را گزارش کرده‌اید'}), 400
+    
+    report = ReportedReview(
+        review_id=review_id,
+        reporter_id=current_user.id,
+        reason=data['reason'],
+        details=data.get('details')
+    )
+    
+    review.reports_count += 1
+    db.session.add(report)
+    db.session.commit()
+    
+    # اگر تعداد گزارش‌ها از حد مجاز بیشتر شد
+    if review.reports_count >= 5:
+        review.is_verified = False
+        db.session.commit()
+    
+    return jsonify({'message': 'گزارش شما ثبت شد'}), 201
+
+@reviews.route('/api/admin/reviews/pending')
+@login_required
+@admin_required
+def get_pending_reviews():
+    """
+    دریافت نظرات در انتظار تأیید
+    """
+    reviews = Review.query.filter_by(is_verified=False)\
+        .order_by(Review.reports_count.desc(),
+                 Review.created_at.desc())\
+        .all()
+    
+    return jsonify([review.to_dict() for review in reviews])
+
+@reviews.route('/api/admin/reviews/<int:review_id>/verify', methods=['POST'])
+@login_required
+@admin_required
+def verify_review(review_id):
+    """
+    تأیید نظر توسط ادمین
+    """
+    review = Review.query.get_or_404(review_id)
+    review.is_verified = True
+    review.reports_count = 0  # ریست کردن گزارش‌ها
+    db.session.commit()
+    
+    return jsonify({'message': 'نظر تأیید شد'})
+```
+
+```html name=app/templates/products/reviews.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>نظرات محصول</title>
+</head>
+<body>
+    <div class="reviews-section">
+        <!-- خلاصه امتیازات -->
+        <div class="ratings-summary">
+            <div class="average-rating">
+                <h3>میانگین امتیاز</h3>
+                <div class="stars">
+                    {% for i in range(5) %}
+                        {% if i < product.average_rating|round|int %}
+                            ★
+                        {% else %}
+                            ☆
+                        {% endif %}
+                    {% endfor %}
+                </div>
+                <p>{{ "%.1f"|format(product.average_rating) }} از 5</p>
+            </div>
+            
+            <div class="rating-bars">
+                {% for i in range(5, 0, -1) %}
+                <div class="rating-bar">
+                    <span>{{ i }} ستاره</span>
+                    <div class="bar">
+                        <div class="fill" style="width: {{ (rating_counts[i] / total_reviews * 100)|round }}%"></div>
+                    </div>
+                    <span>{{ rating_counts[i] }}</span>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- فرم ثبت نظر -->
+        {% if current_user.is_authenticated %}
+        <div class="review-form">
+            <h3>نظر خود را ثبت کنید</h3>
+            <form id="reviewForm" onsubmit="submitReview(event)">
+                <div class="rating-input">
+                    {% for i in range(5, 0, -1) %}
+                    <input type="radio" name="rating" value="{{ i }}" id="star{{ i }}">
+                    <label for="star{{ i }}">★</label>
+                    {% endfor %}
+                </div>
+                
+                <div>
+                    <label>نقاط قوت:</label>
+                    <textarea name="pros" placeholder="نقاط مثبت محصول را بنویسید..."></textarea>
+                </div>
+                
+                <div>
+                    <label>نقاط ضعف:</label>
+                    <textarea name="cons" placeholder="نقاط منفی محصول را بنویسید..."></textarea>
+                </div>
+                
+                <div>
+                    <label>نظر کلی:</label>
+                    <textarea name="comment" required placeholder="نظر خود را بنویسید..."></textarea>
+                </div>
+                
+                <button type="submit">ثبت نظر</button>
+            </form>
+        </div>
+        {% endif %}
+
+        <!-- لیست نظرات -->
+        <div class="reviews-list">
+            <h3>نظرات کاربران</h3>
+            {% for review in reviews %}
+            <div class="review-card">
+                <div class="review-header">
+                    <span class="user">{{ review.user.username }}</span>
+                    {% if review.is_purchased %}
+                    <span class="verified-purchase">خریدار محصول</span>
+                    {% endif %}
+                    <div class="stars">
+                        {% for i in range(5) %}
+                            {% if i < review.rating %}
+                                ★
+                            {% else %}
+                                ☆
+                            {% endif %}
+                        {% endfor %}
+                    </div>
+                </div>
+                
+                {% if review.pros %}
+                <div class="pros">
+                    <h4>نقاط قوت:</h4>
+                    <ul>
+                        {% for pro in review.pros.split('\n') %}
+                        <li>{{ pro }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
+                
+                {% if review.cons %}
+                <div class="cons">
+                    <h4>نقاط ضعف:</h4>
+                    <ul>
+                        {% for con in review.cons.split('\n') %}
+                        <li>{{ con }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
+                
+                <p class="comment">{{ review.comment }}</p>
+                
+                <div class="review-footer">
+                    <span class="date">{{ review.created_at|date }}</span>
+                    {% if current_user.is_authenticated %}
+                    <button onclick="reportReview({{ review.id }})">گزارش</button>
+                    {% endif %}
+                </div>
+
+                <!-- پاسخ‌های ادمین -->
+                {% for reply in review.replies %}
+                <div class="admin-reply">
+                    <strong>پاسخ مدیر:</strong>
+                    <p>{{ reply.content }}</p>
+                    <span class="date">{{ reply.created_at|date }}</span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</body>
+</html>
+```
+
+### 🎯 نکات مهم در این ماژول:
+1. امنیت و کیفیت محتوا:
+   - پاکسازی HTML از نظرات با bleach
+   - سیستم گزارش نظرات نامناسب
+   - تأیید نظرات توسط ادمین
+
+2. قابلیت‌های پیشرفته:
+   - جداسازی نقاط قوت و ضعف
+   - نمایش برچسب "خریدار محصول"
+   - امکان پاسخ ادمین به نظرات
+
+3. تحلیل و آمار:
+   - محاسبه خودکار میانگین امتیازات
+   - نمایش نمودار توزیع امتیازات
+   - تفکیک نظرات تأیید شده و نشده
+
+4. بهینه‌سازی:
+   - استفاده از Event Listeners برای بروزرسانی امتیازات
+   - کش کردن آمارهای پرکاربرد
+   - صفحه‌بندی نظرات
+
+این آخرین ماژول از پروژه فروشگاهی ما بود. آیا مایلید:
+1. یک مرور کلی روی کل پروژه داشته باشیم؟
+2. تست‌های یکپارچه‌سازی بنویسیم؟
+3. یا سؤال خاصی در مورد هر بخش دارید؟
